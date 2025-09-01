@@ -1,0 +1,354 @@
+name: Full Stack JavaScript CI/CD Pipeline
+
+# Pipeline ne zaman çalışsın?
+on:
+  push:
+    branches: [ main, develop ]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Manuel başlatma için
+
+# Genel ayarlar
+env:
+  NODE_VERSION: '18.x'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ADIM 1: Hangi dosyalar değişmiş kontrol et
+  detect-changes:
+    name: Değişiklikleri Tespit Et
+    runs-on: ubuntu-latest
+    outputs:
+      frontend: ${{ steps.changes.outputs.frontend }}
+      backend: ${{ steps.changes.outputs.backend }}
+      database: ${{ steps.changes.outputs.database }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v2
+      id: changes
+      with:
+        filters: |
+          frontend:
+            - 'frontend/**'
+            - 'client/**'
+            - 'src/components/**'
+            - 'public/**'
+          backend:
+            - 'backend/**'
+            - 'server/**'
+            - 'api/**'
+            - 'src/routes/**'
+            - 'src/controllers/**'
+          database:
+            - 'migrations/**'
+            - 'seeds/**'
+            - 'prisma/**'
+            - '*.sql'
+
+  # ADIM 2: Frontend işlemleri
+  frontend-pipeline:
+    name: Frontend Pipeline
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Kodu indir
+      uses: actions/checkout@v4
+      
+    - name: Node.js kur
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: 'frontend/package-lock.json'
+        
+    - name: Paketleri yükle
+      working-directory: ./frontend
+      run: npm ci
+      
+    - name: Kod kalitesi kontrol
+      working-directory: ./frontend
+      run: |
+        npm run lint
+        npm run format:check
+      
+    - name: Testleri çalıştır
+      working-directory: ./frontend
+      run: npm run test:coverage
+      
+    - name: E2E testleri
+      working-directory: ./frontend
+      run: |
+        npx playwright install --with-deps
+        npm run test:e2e
+      
+    - name: Build yap
+      working-directory: ./frontend
+      run: npm run build
+        
+    - name: Build dosyalarını sakla
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-build
+        path: frontend/dist/
+
+  # ADIM 3: Backend işlemleri
+  backend-pipeline:
+    name: Backend Pipeline
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
+    
+    services:
+      # Test için veritabanı
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      # Test için Redis
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Kodu indir
+      uses: actions/checkout@v4
+      
+    - name: Node.js kur
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        cache-dependency-path: 'backend/package-lock.json'
+        
+    - name: Paketleri yükle
+      working-directory: ./backend
+      run: npm ci
+      
+    - name: Kod kalitesi kontrol
+      working-directory: ./backend
+      run: |
+        npm run lint
+        npm run format:check
+      
+    - name: Veritabanı kurulum (test için)
+      working-directory: ./backend
+      run: npm run db:migrate:test
+      env:
+        DATABASE_URL: postgres://postgres:testpassword@localhost:5432/testdb
+        
+    - name: Testleri çalıştır
+      working-directory: ./backend
+      run: npm run test:coverage
+      env:
+        DATABASE_URL: postgres://postgres:testpassword@localhost:5432/testdb
+        REDIS_URL: redis://localhost:6379
+        
+    - name: Entegrasyon testleri
+      working-directory: ./backend
+      run: npm run test:integration
+      env:
+        DATABASE_URL: postgres://postgres:testpassword@localhost:5432/testdb
+        REDIS_URL: redis://localhost:6379
+      
+    - name: Build yap
+      working-directory: ./backend
+      run: npm run build
+        
+    - name: Build dosyalarını sakla
+      uses: actions/upload-artifact@v4
+      with:
+        name: backend-build
+        path: |
+          backend/dist/
+          backend/package.json
+          backend/package-lock.json
+
+  # ADIM 4: Güvenlik kontrolü
+  security-analysis:
+    name: Güvenlik Taraması
+    runs-on: ubuntu-latest
+    needs: [frontend-pipeline, backend-pipeline]
+    if: always()
+    
+    steps:
+    - name: Kodu indir
+      uses: actions/checkout@v4
+      
+    - name: Güvenlik açıklarını kontrol et
+      run: |
+        if [ -d "frontend" ]; then
+          cd frontend && npm audit --audit-level high
+        fi
+        if [ -d "backend" ]; then
+          cd backend && npm audit --audit-level high
+        fi
+      
+    - name: Kod analizi başlat
+      uses: github/codeql-action/init@v3
+      with:
+        languages: javascript
+        
+    - name: Otomatik build
+      uses: github/codeql-action/autobuild@v3
+      
+    - name: Kod analizi tamamla
+      uses: github/codeql-action/analyze@v3
+
+  # ADIM 5: Docker image'ları oluştur
+  containerization:
+    name: Docker Images
+    runs-on: ubuntu-latest
+    needs: [frontend-pipeline, backend-pipeline, security-analysis]
+    if: github.ref == 'refs/heads/main'
+    
+    strategy:
+      matrix:
+        service: [frontend, backend]
+    
+    steps:
+    - name: Kodu indir
+      uses: actions/checkout@v4
+      
+    - name: Docker kurulum
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Registry'e giriş
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Build dosyalarını indir
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ matrix.service }}-build
+        path: ./${{ matrix.service }}/
+        
+    - name: Docker metadata hazırla
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=semver,pattern={{version}}
+          type=sha,prefix={{branch}}-
+          
+    - name: Docker image oluştur ve yükle
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+
+  # ADIM 6: Veritabanı güncellemeleri
+  database-migration:
+    name: Veritabanı Güncelleme
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.database == 'true' && github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Kodu indir
+      uses: actions/checkout@v4
+      
+    - name: Node.js kur
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        
+    - name: Migration çalıştır
+      working-directory: ./backend
+      run: |
+        npm ci
+        npm run db:migrate:deploy
+      env:
+        DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+
+  # ADIM 7: Test ortamına deploy
+  deploy-staging:
+    name: Test Ortamına Deploy
+    runs-on: ubuntu-latest
+    needs: [frontend-pipeline, backend-pipeline, security-analysis]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Build dosyalarını indir
+      uses: actions/download-artifact@v4
+      
+    - name: Test ortamına yükle
+      run: |
+        echo "🚀 Test ortamına yükleniyor..."
+        # Buraya deployment komutlarınızı ekleyin
+        # Örnek: Vercel, Netlify, AWS S3 vs.
+        
+    - name: Test ortamı kontrolü
+      run: |
+        echo "🧪 Test ortamı kontrol ediliyor..."
+        # Health check komutları
+
+  # ADIM 8: Canlı ortama deploy
+  deploy-production:
+    name: Canlı Ortama Deploy
+    runs-on: ubuntu-latest
+    needs: [containerization, database-migration]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Canlı ortama yükle
+      run: |
+        echo "🚀 Canlı ortama yükleniyor..."
+        # Production deployment komutları
+        
+    - name: Canlı ortam kontrolü
+      run: |
+        echo "💚 Canlı ortam kontrol ediliyor..."
+        # Production health checks
+        
+    - name: Hata durumunda geri al
+      if: failure()
+      run: |
+        echo "❌ Hata! Önceki versiona dönülüyor..."
+        # Rollback komutları
+
+  # ADIM 9: Bildirimler
+  notifications:
+    name: Bildirimler
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Başarılı bildirim
+      if: success()
+      run: |
+        echo "✅ Deploy başarılı!"
+        # Slack, email vs. bildirim
+        
+    - name: Hata bildirimi
+      if: failure()
+      run: |
+        echo "🚨 Deploy başarısız!"
+        # Hata bildirimi gönder
